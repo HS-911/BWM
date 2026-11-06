@@ -1,0 +1,302 @@
+# ====================================================================
+# 01. Import libraries and set up table display
+# ====================================================================
+import numpy as np
+import pandas as pd
+from scipy.optimize import linprog
+import matplotlib.pyplot as plt
+
+try:
+    from IPython.display import display
+except ImportError:
+    display = print
+
+
+# ====================================================================
+# 02. Enter survey ranks for colour, brand, body style, and year
+# ====================================================================
+# Fill in the Rank column. Rank 1 is the most preferred choice.
+SURVEY = pd.DataFrame([
+    ["Exterior colour",      "Gray, black roof", 4],
+    ["Exterior colour",      "White",            2],
+    ["Exterior colour",      "Silver",           3],
+    ["Exterior colour",      "Black",            1],
+    ["Make (brand)",         "Toyota",           1],
+    ["Make (brand)",         "Volkswagen",       2],
+    ["Make (brand)",         "Chevrolet",        3],
+    ["Body style (segment)", "Midsize sedan",    1],
+    ["Body style (segment)", "Compact sedan",    2],
+    ["Model year",           2020,               3],
+    ["Model year",           2024,               2],
+    ["Model year",           2025,               1],
+], columns=["KPI", "Choice", "Rank"])
+
+# ====================================================================
+# 03. Set trip distance, fuel price, and CO2 factor
+# ====================================================================
+distance_per_day = 350  # km/day
+fuel_price = 1.65       # CAD/L
+co2_per_litre = 2.3     # kg CO2/L
+
+# ====================================================================
+# 04. List the four rental cars and their raw KPIs
+# ====================================================================
+# Vehicle data in A, B, C, D order.
+# Daily rates are estimates. Model years and equipment levels are exercise assumptions.
+cars = [
+    "A  Toyota Camry (gray)", "B  Toyota Camry (white)",
+    "C  Volkswagen Jetta", "D  Chevrolet Malibu",
+]
+
+raw_kpis = pd.DataFrame({
+    "Exterior colour": ["Gray, black roof", "White", "Silver", "Black"],
+    "Make (brand)": ["Toyota", "Toyota", "Volkswagen", "Chevrolet"],
+    "Fuel use": [5.3, 9.2, 7.4, 7.7],  # L/100 km
+    "Body style (segment)": ["Midsize sedan", "Midsize sedan", "Compact sedan", "Midsize sedan"],
+    "Daily rate": [85, 70, 65, 55],  # CAD/day
+    "Model year": [2025, 2020, 2025, 2024],
+    "Powertrain": ["2.5 L hybrid", "3.5 L gasoline V6", "1.5 L turbo gas", "1.5 L turbo gas"],
+    "Equipment level": ["Full option", "Premium", "Sport package", "Standard"],
+}, index=pd.Index(cars, name="Rental option"))
+
+# ====================================================================
+# 05. Set fixed ranks for powertrain and equipment
+# ====================================================================
+fixed_ranks = pd.DataFrame([
+    ["Powertrain",      "2.5 L hybrid",      2],
+    ["Powertrain",      "3.5 L gasoline V6", 1],
+    ["Powertrain",      "1.5 L turbo gas",   1],
+    ["Equipment level", "Full option",       1],
+    ["Equipment level", "Premium",           2],
+    ["Equipment level", "Sport package",     3],
+    ["Equipment level", "Standard",          4],
+], columns=SURVEY.columns)
+
+# ====================================================================
+# 06. Set KPI coefficients and flag criteria where lower is better
+# ====================================================================
+criterion_kpi_weights = {
+    "Comfort": {"Body style (segment)": 0.5, "Equipment level": 0.4, "Model year": 0.1},
+    "Style": {"Exterior colour": 0.7, "Make (brand)": 0.3},
+    "Safety": {
+        "Equipment level": 0.45, "Model year": 0.05, "Make (brand)": 0.1,
+        "Body style (segment)": 0.3, "Powertrain": 0.1,
+    },
+    "Quality": {"Make (brand)": 0.8, "Model year": 0.2},
+}
+lower_is_better = {"Cost", "Sustainability"}
+
+# ====================================================================
+# 07. Set consistency ratio (CRI) reference limits
+# ====================================================================
+# Liang et al. (2020), Table 3 and footnote 2.
+# The first key is the number of criteria. The second is the best-over-worst rating.
+cri_limits = {
+    6: {
+        2: 0, 3: 0.1667, 4: 0.2206, 5: 0.2546,
+        6: 0.3044, 7: 0.3029, 8: 0.3154, 9: 0.3337,
+    },
+    7: {
+        2: 0, 3: 0.1667, 4: 0.2527, 5: 0.2716,
+        6: 0.3144, 7: 0.3144, 8: 0.3408, 9: 0.3517,
+    },
+}
+
+
+# ====================================================================
+# 08. Define how to scale values from 0 to 1
+# ====================================================================
+def normalize(values, *, higher_is_better):
+    """Return scores where 0 is worst and 1 is best."""
+    low, high = values.min(), values.max()
+    span = high - low
+
+    if np.isclose(span, 0, rtol=0, atol=1e-12):
+        return pd.Series(1.0, index=values.index)
+
+    if higher_is_better:
+        return (values - low) / span
+    return (high - values) / span
+
+
+# ====================================================================
+# 09. Read and validate whole-number responses
+# ====================================================================
+def ask_int(prompt, allowed):
+    while True:
+        answer = input(prompt).strip()
+        if answer.isdecimal() and int(answer) in allowed:
+            return int(answer)
+        print("Choose one of", ", ".join(map(str, allowed)))
+
+
+# ====================================================================
+# 10. Define the linear BWM weight solver
+# ====================================================================
+def solve_bwm(best, worst, bo, ow):
+    n = len(bo)
+    comparisons = [(best, j, bo[j]) for j in range(n) if j != best]
+    # The first list includes the shared best-over-worst comparison.
+    comparisons += [(j, worst, ow[j]) for j in range(n) if j not in (best, worst)]
+
+    constraints = []
+    for left, right, judgment in comparisons:
+        difference = np.zeros(n)
+        difference[left] = 1
+        difference[right] = -judgment
+
+        # Require |w[left] - judgment * w[right]| <= xi.
+        constraints.extend([np.r_[difference, -1], np.r_[-difference, -1]])
+
+    fit = linprog(
+        c=np.r_[np.zeros(n), 1],  # Minimize xi, the final variable.
+        A_ub=constraints,
+        b_ub=np.zeros(len(constraints)),
+        A_eq=[np.r_[np.ones(n), 0]],  # The weights sum to 1.
+        b_eq=[1],
+        bounds=[(0, None)] * (n + 1),
+        method="highs",
+    )
+    if not fit.success:
+        raise RuntimeError(f"BWM solver failed: {fit.message}")
+    return fit.x[:-1]
+
+
+# ====================================================================
+# 11. Validate ranks and convert them to KPI scores
+# ====================================================================
+# Smaller ranks score higher.
+rank_table = pd.concat([SURVEY, fixed_ranks], ignore_index=True)
+kpi_preferences = pd.DataFrame(index=raw_kpis.index)
+
+for kpi in raw_kpis.columns.drop(["Fuel use", "Daily rate"]):
+    choices = rank_table.loc[rank_table["KPI"].eq(kpi)].set_index("Choice")
+    if not choices.index.is_unique or set(choices.index) != set(raw_kpis[kpi]):
+        raise ValueError(f"Enter one rank per {kpi} choice.")
+
+    ranks = pd.to_numeric(choices["Rank"], errors="coerce")
+    if not ranks.between(1, len(choices)).all():
+        raise ValueError(f"Fill in {kpi} ranks from 1 to {len(choices)}.")
+
+    kpi_preferences[kpi] = raw_kpis[kpi].map(normalize(ranks, higher_is_better=False))
+
+# ====================================================================
+# 12. Calculate the six raw criterion values
+# ====================================================================
+litres_per_day = raw_kpis["Fuel use"] * distance_per_day / 100  # L/day
+raw_criteria = pd.DataFrame(index=raw_kpis.index)
+raw_criteria["Cost"] = raw_kpis["Daily rate"] + litres_per_day * fuel_price  # CAD/day
+
+for criterion, coefficients in criterion_kpi_weights.items():
+    factors = pd.Series(coefficients)
+    raw_criteria[criterion] = kpi_preferences[factors.index].dot(factors)
+
+raw_criteria["Sustainability"] = litres_per_day * co2_per_litre  # kg CO2/day
+if not np.isfinite(raw_criteria.to_numpy()).all():
+    raise ValueError("Check the vehicle data for missing or non-finite values.")
+
+# ====================================================================
+# 13. Scale each criterion to 0–1 across the four cars
+# ====================================================================
+criterion_scores = pd.DataFrame({
+    name: normalize(values, higher_is_better=name not in lower_is_better)
+    for name, values in raw_criteria.items()
+})
+
+# ====================================================================
+# 14. Display the KPI and criterion tables
+# ====================================================================
+for title, table in [
+    ("Vehicle KPIs", raw_kpis),
+    ("Categorical KPI scores (0 = worst, 1 = best)", kpi_preferences),
+    ("Calculated criteria (before normalization)", raw_criteria),
+    ("Normalized criteria (0 = worst, 1 = best)", criterion_scores),
+]:
+    print(f"\n{title}")
+    display(table.T.round(3))
+
+
+# ====================================================================
+# 15. Select the most and least important criteria
+# ====================================================================
+criteria = list(criterion_scores.columns)
+n = len(criteria)
+for number, name in enumerate(criteria, 1):
+    print(f"{number}. {name}")
+
+numbers = range(1, n + 1)
+best = ask_int("Most important criterion number: ", numbers) - 1
+worst = ask_int(
+    "Least important criterion number: ",
+    [number for number in numbers if number != best + 1],
+) - 1
+
+best_name, worst_name = criteria[best], criteria[worst]
+print("\nEnter 1 for equal importance or up to 9 for extreme importance.")
+
+# ====================================================================
+# 16. Collect Best-to-Others, then Others-to-Worst ratings
+# ====================================================================
+print("\nBest-to-Others comparisons")
+a_bw = ask_int(f"{best_name} over {worst_name} (1–9): ", range(1, 10))
+bo = np.ones(n)
+ow = np.ones(n)
+bo[worst] = ow[best] = a_bw
+
+if a_bw > 1:
+    allowed = range(1, a_bw + 1)
+    middle = [j for j in range(n) if j not in (best, worst)]
+
+    for j in middle:
+        bo[j] = ask_int(f"{best_name} over {criteria[j]} (1–{a_bw}): ", allowed)
+
+    print("\nOthers-to-Worst comparisons")
+    for j in middle:
+        ow[j] = ask_int(f"{criteria[j]} over {worst_name} (1–{a_bw}): ", allowed)
+
+# ====================================================================
+# 17. Calculate the six criterion weights with linear BWM
+# ====================================================================
+weights = pd.Series(solve_bwm(best, worst, bo, ow), index=criteria, name="BWM weight")
+
+# ====================================================================
+# 18. Check comparison consistency and display results
+# ====================================================================
+local_cri = np.zeros(n)
+if a_bw > 1:
+    local_cri = np.abs(bo * ow - a_bw) / (a_bw * (a_bw - 1))
+
+print("\nPairwise comparisons and BWM weights")
+display(pd.DataFrame({
+    "Best over criterion": bo,
+    "Criterion over worst": ow,
+    "BWM weight": weights,
+    "Local CRI": local_cri,
+}).round(4))
+
+cri = float(local_cri.max())
+limit = cri_limits.get(n, {}).get(a_bw)
+print(f"Input-based CRI = {cri:.4f}")
+if limit is not None:
+    status = "review judgments" if cri > limit else "within the reference limit"
+    print(f"CRI threshold = {limit:.4f} ({status})")
+
+# ====================================================================
+# 19. Rank the cars by their weighted scores
+# ====================================================================
+total = criterion_scores.dot(weights)
+ranking = pd.DataFrame({
+    "Rank": total.round(12).rank(ascending=False, method="min").astype(int),
+    "Weighted score": total,
+}).sort_values("Rank", kind="stable")
+
+print("\nFort McKay rental ranking (higher is better)")
+display(ranking.round(4))
+
+# ====================================================================
+# 20. Plot the criterion weights
+# ====================================================================
+weights.sort_values().plot.barh(title="BWM criterion weights", xlim=(0, 1))
+plt.xlabel("Weight")
+plt.tight_layout()
+plt.show()
